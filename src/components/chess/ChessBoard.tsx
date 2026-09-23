@@ -142,7 +142,12 @@ export default function ChessBoard() {
     }
   }, [gameMode, playerColor]);
 
-  // Web Worker setup & lifecycle
+  const updateStateFromGameRef = useRef(updateStateFromGame);
+  useEffect(() => {
+    updateStateFromGameRef.current = updateStateFromGame;
+  }, [updateStateFromGame]);
+
+  // Web Worker setup & lifecycle (mounted once)
   useEffect(() => {
     setMounted(true);
 
@@ -163,7 +168,7 @@ export default function ChessBoard() {
           const appliedMove = chessRef.current.move(move);
           if (appliedMove) {
             setLastMove({ from: appliedMove.from as Square, to: appliedMove.to as Square });
-            updateStateFromGame();
+            updateStateFromGameRef.current();
             setAiTelemetry({
               depth: e.data.depthReached,
               nodesEvaluated: e.data.nodes,
@@ -191,7 +196,7 @@ export default function ChessBoard() {
       worker.terminate();
       workerRef.current = null;
     };
-  }, [updateStateFromGame]);
+  }, []);
 
   // Execute move safely in chess.js
   const makeAMove = (from: Square, to: Square): boolean => {
