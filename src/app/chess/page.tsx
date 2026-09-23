@@ -16,7 +16,7 @@ export default function ChessPage() {
             Chess AI
           </h1>
           <p className="text-slate-400 text-xs md:text-sm">
-            Phase 5: Play vs AI Engine (Negamax & Web Worker offloaded)
+            Explainable AI Engine (Negamax, Alpha-Beta, Quiescence & Web Worker Offloaded)
           </p>
         </header>
 
