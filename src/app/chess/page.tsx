@@ -9,7 +9,7 @@ export const metadata = {
 export default function ChessPage() {
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-start py-10 px-4 md:px-8 selection:bg-amber-500/30">
-      <div className="w-full max-w-5xl flex flex-col items-center gap-8">
+      <div className="w-full max-w-[1440px] flex flex-col items-center gap-8">
         {/* Header */}
         <header className="flex flex-col items-center text-center gap-1.5">
           <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-white drop-shadow-sm">

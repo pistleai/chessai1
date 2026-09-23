@@ -1,10 +1,70 @@
-import { Chess, Move } from 'chess.js';
-import { evaluate, PIECE_VALUES } from './evaluation';
+import { Chess, Move, PieceSymbol } from 'chess.js';
+import {
+  evaluate,
+  PIECE_VALUES,
+  PST,
+  KING_ENDGAME_TABLE,
+  isEndgame,
+  evaluateWhitePerspective,
+} from './evaluation';
 import {
   transpositionTable,
   getPositionKey,
   TTFlag,
 } from './transposition';
+
+export interface SearchStats {
+  totalNodes: number;
+  classicCutoffs: number;
+  ttCutoffs: number;
+  quiescenceCutoffs: number;
+  qNodes: number;
+  // Forward-compatibility hooks for Phase 12 & 13
+  nullMoveCutoffs: number;
+  lmrResearches: number;
+}
+
+export function createSearchStats(): SearchStats {
+  return {
+    totalNodes: 0,
+    classicCutoffs: 0,
+    ttCutoffs: 0,
+    quiescenceCutoffs: 0,
+    qNodes: 0,
+    nullMoveCutoffs: 0,
+    lmrResearches: 0,
+  };
+}
+
+export interface CandidateMoveEval {
+  san: string;
+  from: string;
+  to: string;
+  whiteScore: number;        // ALWAYS White perspective for display
+  nodes: number;
+  isBest: boolean;
+  rationale: string;         // Delta-derived rationale
+  scoreDelta?: number;       // Difference from best move
+}
+
+export interface DepthIterationInfo {
+  depth: number;
+  bestMoveSan: string;
+  whiteScore: number;
+  timeMs: number;
+  nodes: number;             // Isolated delta for this depth
+}
+
+export interface DetailedSearchResult {
+  bestMove: Move | null;
+  score: number;
+  whiteScore: number;
+  depthReached: number;
+  stats: SearchStats;
+  timeMs: number;
+  candidateMoves: CandidateMoveEval[];
+  depthIterations: DepthIterationInfo[];
+}
 
 export interface AISearchResult {
   bestMove: Move | null;
@@ -27,10 +87,6 @@ export interface IterativeSearchResult {
  * 1. Transposition Table best move from prior search / shallower depth.
  * 2. Captures sorted by MVV (Most Valuable Victim: Q > R > B > N > P).
  * 3. Quiet moves.
- *
- * @param moves Array of verbose Move objects
- * @param ttMove Optional best move recorded in Transposition Table or previous iteration
- * @returns Sorted array of Move objects
  */
 export function orderMoves(moves: Move[], ttMove?: Move | null): Move[] {
   return [...moves].sort((a, b) => {
@@ -50,27 +106,28 @@ export function orderMoves(moves: Move[], ttMove?: Move | null): Move[] {
 /**
  * Quiescence search evaluates only tactical capture moves (and check escapes)
  * at the leaf of the minimax tree. Mitigates the horizon effect.
- *
- * @param game Active Chess instance
- * @param alpha Lower bound score
- * @param beta Upper bound score
- * @param onNode Optional node counter callback
- * @param maxQDepth Maximum capture recursion plies (default: 6)
- * @returns Score from current side-to-move's perspective
  */
 export function quiesce(
   game: Chess,
   alpha: number,
   beta: number,
   onNode?: () => boolean,
-  maxQDepth: number = 6
+  maxQDepth: number = 6,
+  stats?: SearchStats
 ): number {
+  if (stats) {
+    stats.totalNodes++;
+    stats.qNodes++;
+  }
   if (onNode && onNode()) return 0;
   if (game.isGameOver()) return evaluate(game);
 
   const standPat = evaluate(game);
 
-  if (standPat >= beta) return beta;
+  if (standPat >= beta) {
+    if (stats) stats.quiescenceCutoffs++;
+    return beta;
+  }
   if (standPat > alpha) alpha = standPat;
   if (maxQDepth <= 0) return alpha;
 
@@ -87,12 +144,15 @@ export function quiesce(
 
   for (const move of orderedCaptures) {
     game.move(move);
-    const score = -quiesce(game, -beta, -alpha, onNode, maxQDepth - 1);
+    const score = -quiesce(game, -beta, -alpha, onNode, maxQDepth - 1, stats);
     game.undo();
 
     if (onNode && onNode()) return 0;
 
-    if (score >= beta) return beta;
+    if (score >= beta) {
+      if (stats) stats.quiescenceCutoffs++;
+      return beta;
+    }
     if (score > alpha) alpha = score;
   }
 
@@ -102,33 +162,37 @@ export function quiesce(
 /**
  * Recursive Negamax search with Alpha-Beta pruning, Transposition Table lookup,
  * and time-checking capability.
- *
- * @param game Active Chess game instance
- * @param depth Remaining search depth
- * @param alpha Lower bound score
- * @param beta Upper bound score
- * @param onNode Optional node callback, returns true if time budget exceeded
- * @returns Best score achievable from this position
  */
 export function negamax(
   game: Chess,
   depth: number,
   alpha: number,
   beta: number,
-  onNode?: () => boolean
+  onNode?: () => boolean,
+  stats?: SearchStats
 ): number {
+  if (stats) stats.totalNodes++;
   if (onNode && onNode()) return 0;
   if (game.isGameOver()) return evaluate(game);
-  if (depth === 0) return quiesce(game, alpha, beta, onNode);
+  if (depth === 0) return quiesce(game, alpha, beta, onNode, 6, stats);
 
   // Transposition Table lookup
   const key = getPositionKey(game.fen());
   const entry = transpositionTable.get(key);
 
   if (entry && entry.depth >= depth) {
-    if (entry.flag === 'exact') return entry.score;
-    if (entry.flag === 'lower' && entry.score >= beta) return entry.score;
-    if (entry.flag === 'upper' && entry.score <= alpha) return entry.score;
+    if (entry.flag === 'exact') {
+      if (stats) stats.ttCutoffs++;
+      return entry.score;
+    }
+    if (entry.flag === 'lower' && entry.score >= beta) {
+      if (stats) stats.ttCutoffs++;
+      return entry.score;
+    }
+    if (entry.flag === 'upper' && entry.score <= alpha) {
+      if (stats) stats.ttCutoffs++;
+      return entry.score;
+    }
   }
 
   const origAlpha = alpha;
@@ -138,7 +202,7 @@ export function negamax(
 
   for (const move of moves) {
     game.move(move);
-    const score = -negamax(game, depth - 1, -beta, -alpha, onNode);
+    const score = -negamax(game, depth - 1, -beta, -alpha, onNode, stats);
     game.undo();
 
     if (onNode && onNode()) return 0;
@@ -151,6 +215,7 @@ export function negamax(
       alpha = score;
     }
     if (alpha >= beta) {
+      if (stats) stats.classicCutoffs++;
       break; // Alpha-beta cutoff
     }
   }
@@ -177,166 +242,128 @@ export function negamax(
 }
 
 /**
- * Iterative Deepening search with a strict time budget.
- *
- * Starts searching at depth 1, then depth 2, then depth 3...
- * At each new depth, orders the previous iteration's best move to the front
- * of the move list for optimal alpha-beta cutoffs.
- *
- * If the time budget is exceeded mid-search, gracefully stops and returns
- * the best move found from the deepest fully completed iteration.
- *
- * @param fen FEN string representing the position
- * @param timeLimitMs Time budget in milliseconds (default: 2000ms)
- * @param maxDepth Maximum depth ceiling (default: 20)
- * @returns IterativeSearchResult with the best move and search metrics
+ * Helper to get PST value for a piece on a square.
  */
-export function getBestMoveIterative(
-  fen: string,
-  timeLimitMs: number = 2000,
-  maxDepth: number = 20
-): IterativeSearchResult {
-  const game = new Chess(fen);
-  if (game.isGameOver()) {
-    return {
-      bestMove: null,
-      score: evaluate(game),
-      depthReached: 0,
-      nodes: 0,
-      timeMs: 0,
-    };
+export function getSquarePST(
+  pieceType: PieceSymbol,
+  color: 'w' | 'b',
+  square: string,
+  isEndgamePos: boolean
+): number {
+  const col = square.charCodeAt(0) - 97;
+  const row = 8 - parseInt(square[1], 10);
+  if (col < 0 || col > 7 || row < 0 || row > 7) return 0;
+
+  if (pieceType === 'k' && isEndgamePos) {
+    return color === 'w' ? KING_ENDGAME_TABLE[row][col] : KING_ENDGAME_TABLE[7 - row][col];
   }
-
-  const legalMoves = orderMoves(game.moves({ verbose: true }));
-  if (legalMoves.length === 0) {
-    return {
-      bestMove: null,
-      score: evaluate(game),
-      depthReached: 0,
-      nodes: 0,
-      timeMs: 0,
-    };
-  }
-
-  const startTime = Date.now();
-  const deadline = startTime + timeLimitMs;
-
-  let totalNodes = 0;
-  let bestOverallMove: Move = legalMoves[0];
-  let bestOverallScore = -Infinity;
-  let completedDepth = 0;
-  let isTimeUp = false;
-
-  // Lightweight periodic time checker (checks every 1024 nodes)
-  const checkTime = (): boolean => {
-    totalNodes++;
-    if ((totalNodes & 1023) === 0) {
-      if (Date.now() >= deadline) {
-        isTimeUp = true;
-      }
-    }
-    return isTimeUp;
-  };
-
-  for (let currentDepth = 1; currentDepth <= maxDepth; currentDepth++) {
-    if (Date.now() >= deadline) {
-      break;
-    }
-
-    let iterationBestMove: Move = bestOverallMove;
-    let iterationBestScore = -Infinity;
-    let iterationAlpha = -Infinity;
-    const iterationBeta = Infinity;
-
-    // Order root moves with previous iteration's best move at the very front
-    const currentMoves = orderMoves(legalMoves, bestOverallMove);
-    let iterationCompleted = true;
-
-    for (const move of currentMoves) {
-      if (checkTime()) {
-        iterationCompleted = false;
-        break;
-      }
-
-      game.move(move);
-      const score = -negamax(
-        game,
-        currentDepth - 1,
-        -iterationBeta,
-        -iterationAlpha,
-        checkTime
-      );
-      game.undo();
-
-      if (isTimeUp) {
-        iterationCompleted = false;
-        break;
-      }
-
-      if (score > iterationBestScore) {
-        iterationBestScore = score;
-        iterationBestMove = move;
-      }
-      if (score > iterationAlpha) {
-        iterationAlpha = score;
-      }
-    }
-
-    if (iterationCompleted) {
-      bestOverallMove = iterationBestMove;
-      bestOverallScore = iterationBestScore;
-      completedDepth = currentDepth;
-
-      // Checkmate found: no need to search deeper
-      if (bestOverallScore === Infinity || bestOverallScore === -Infinity) {
-        break;
-      }
-    } else {
-      // Time expired mid-iteration; preserve bestOverallMove from previous completed depth
-      break;
-    }
-  }
-
-  // Update root position in TT
-  const rootKey = getPositionKey(fen);
-  transpositionTable.set(rootKey, {
-    depth: completedDepth,
-    score: bestOverallScore,
-    flag: 'exact',
-    bestMove: bestOverallMove,
-  });
-
-  return {
-    bestMove: bestOverallMove,
-    score: bestOverallScore,
-    depthReached: completedDepth,
-    nodes: totalNodes,
-    timeMs: Date.now() - startTime,
-  };
+  const table = PST[pieceType];
+  if (!table || !table[row]) return 0;
+  return color === 'w' ? table[row][col] : table[7 - row][col];
 }
 
 /**
- * Entry point for AI move selection.
- * Supports fixed-depth search or time-limited iterative deepening.
- *
- * @param fen FEN string representing the position
- * @param depth Search depth (default: 3)
- * @param timeLimitMs Optional time budget in milliseconds. If > 0, performs iterative deepening.
- * @returns Best Move object or null if game is over / no legal moves
+ * Derives truthful, delta-derived rationale without canned phrase banks.
+ * Priority order:
+ * 1. Checkmate
+ * 2. Checks
+ * 3. Captures
+ * 4. Promotions
+ * 5. Castling
+ * 6. Central Space Occupation (e4/d4/e5/d5)
+ * 7. Positional PST Delta
+ * 8. Fallback
  */
-export function getBestMove(
-  fen: string,
-  depth = 3,
-  timeLimitMs?: number
-): Move | null {
-  if (timeLimitMs && timeLimitMs > 0) {
-    const res = getBestMoveIterative(fen, timeLimitMs, 20);
-    return res.bestMove;
+export function deriveMoveRationale(move: Move, gameBeforeMove: Chess): string {
+  const testGame = new Chess(gameBeforeMove.fen());
+  try {
+    testGame.move(move);
+  } catch {
+    // fallback
   }
 
+  // 1. Checkmate
+  if (testGame.isCheckmate()) {
+    return 'Delivers checkmate! Game over.';
+  }
+
+  // 2. Checks
+  if (testGame.inCheck()) {
+    if (move.captured) {
+      const victim = getPieceName(move.captured);
+      const val = PIECE_VALUES[move.captured as keyof typeof PIECE_VALUES] ?? 0;
+      return `Captures ${victim} (+${val}) with check!`;
+    }
+    return 'Delivers check to enemy King';
+  }
+
+  // 3. Captures
+  if (move.captured) {
+    const victim = getPieceName(move.captured);
+    const val = PIECE_VALUES[move.captured as keyof typeof PIECE_VALUES] ?? 0;
+    return `Captures ${victim} (+${val})`;
+  }
+
+  // 4. Promotions
+  if (move.promotion) {
+    return 'Promotes pawn to Queen';
+  }
+
+  // 5. Castling
+  if (move.flags && (move.flags.includes('k') || move.flags.includes('q'))) {
+    return 'Castles for King safety and Rook activation';
+  }
+
+  // Positional PST deltas
+  const isEndgamePos = isEndgame(gameBeforeMove);
+  const pstFrom = getSquarePST(move.piece, move.color, move.from, isEndgamePos);
+  const pstTo = getSquarePST(move.piece, move.color, move.to, isEndgamePos);
+  const pstDelta = pstTo - pstFrom;
+
+  // 6. Central Space Occupation (placed before generic PST delta to eliminate dead code)
+  const centralSquares = ['e4', 'd4', 'e5', 'd5'];
+  if (centralSquares.includes(move.to)) {
+    const sign = pstDelta >= 0 ? `+${pstDelta}` : `${pstDelta}`;
+    return `Claims critical central square ${move.to.toUpperCase()} (${sign} activity)`;
+  }
+
+  // 7. Positional PST Delta
+  if (pstDelta >= 10) {
+    return `Improves piece activity (+${pstDelta})`;
+  }
+  if (pstDelta <= -10) {
+    return `Retreats to passive square (${pstDelta})`;
+  }
+
+  // 8. Fallback
+  if (move.piece === 'p') {
+    return 'Advances pawn for board space';
+  }
+  return `Develops ${getPieceName(move.piece)} and improves piece coordination`;
+}
+
+/**
+ * Detailed fixed-depth search that collects full candidate move evaluations,
+ * search stats, and White-perspective scores.
+ */
+export function getBestMoveDetailed(fen: string, depth = 3): DetailedSearchResult {
   const game = new Chess(fen);
+  const stats = createSearchStats();
+  const startTime = Date.now();
+
   if (game.isGameOver()) {
-    return null;
+    const score = evaluate(game);
+    const whiteScore = evaluateWhitePerspective(game) / 100;
+    return {
+      bestMove: null,
+      score,
+      whiteScore,
+      depthReached: 0,
+      stats,
+      timeMs: 0,
+      candidateMoves: [],
+      depthIterations: [],
+    };
   }
 
   const key = getPositionKey(fen);
@@ -344,18 +371,37 @@ export function getBestMove(
   const moves = orderMoves(game.moves({ verbose: true }), rootEntry?.bestMove);
 
   if (moves.length === 0) {
-    return null;
+    const score = evaluate(game);
+    const whiteScore = evaluateWhitePerspective(game) / 100;
+    return {
+      bestMove: null,
+      score,
+      whiteScore,
+      depthReached: 0,
+      stats,
+      timeMs: 0,
+      candidateMoves: [],
+      depthIterations: [],
+    };
   }
 
-  let bestMove: Move | null = moves[0];
+  let bestMove: Move = moves[0];
   let bestScore = -Infinity;
   let alpha = -Infinity;
   const beta = Infinity;
 
+  const candidateEvals: { move: Move; score: number; whiteScore: number; nodes: number }[] = [];
+
   for (const move of moves) {
+    const candNodesBefore = stats.totalNodes;
     game.move(move);
-    const score = -negamax(game, depth - 1, -beta, -alpha);
+    const score = -negamax(game, depth - 1, -beta, -alpha, undefined, stats);
     game.undo();
+    const candNodes = stats.totalNodes - candNodesBefore;
+
+    // Convert to White perspective in pawns
+    const whiteScore = (game.turn() === 'w' ? score : -score) / 100;
+    candidateEvals.push({ move, score, whiteScore, nodes: candNodes });
 
     if (score > bestScore) {
       bestScore = score;
@@ -374,8 +420,274 @@ export function getBestMove(
     bestMove,
   });
 
-  return bestMove;
+  // Sort candidate moves so the chosen best move is first, followed by descending move quality
+  candidateEvals.sort((a, b) => b.score - a.score);
+
+  const bestCandScore = candidateEvals[0].whiteScore;
+  const candidateMoves: CandidateMoveEval[] = candidateEvals.map((cand, idx) => {
+    const isBest = idx === 0;
+    const scoreDelta = isBest
+      ? 0
+      : Number((cand.whiteScore - bestCandScore).toFixed(2));
+    const rationale = deriveMoveRationale(cand.move, game);
+
+    return {
+      san: cand.move.san,
+      from: cand.move.from,
+      to: cand.move.to,
+      whiteScore: cand.whiteScore,
+      nodes: cand.nodes,
+      isBest,
+      rationale,
+      scoreDelta,
+    };
+  });
+
+  const whiteScore = (game.turn() === 'w' ? bestScore : -bestScore) / 100;
+  const timeMs = Date.now() - startTime;
+
+  const depthIterations: DepthIterationInfo[] = [
+    {
+      depth,
+      bestMoveSan: bestMove.san,
+      whiteScore,
+      timeMs,
+      nodes: stats.totalNodes,
+    },
+  ];
+
+  return {
+    bestMove,
+    score: bestScore,
+    whiteScore,
+    depthReached: depth,
+    stats,
+    timeMs,
+    candidateMoves,
+    depthIterations,
+  };
 }
+
+/**
+ * Detailed Iterative Deepening search with strict time budget,
+ * per-depth isolated node counts, and candidate move collection.
+ */
+export function getBestMoveIterativeDetailed(
+  fen: string,
+  timeLimitMs: number = 2000,
+  maxDepth: number = 20
+): DetailedSearchResult {
+  const game = new Chess(fen);
+  const stats = createSearchStats();
+  const startTime = Date.now();
+  const deadline = startTime + timeLimitMs;
+
+  if (game.isGameOver()) {
+    const score = evaluate(game);
+    const whiteScore = evaluateWhitePerspective(game) / 100;
+    return {
+      bestMove: null,
+      score,
+      whiteScore,
+      depthReached: 0,
+      stats,
+      timeMs: 0,
+      candidateMoves: [],
+      depthIterations: [],
+    };
+  }
+
+  const legalMoves = orderMoves(game.moves({ verbose: true }));
+  if (legalMoves.length === 0) {
+    const score = evaluate(game);
+    const whiteScore = evaluateWhitePerspective(game) / 100;
+    return {
+      bestMove: null,
+      score,
+      whiteScore,
+      depthReached: 0,
+      stats,
+      timeMs: 0,
+      candidateMoves: [],
+      depthIterations: [],
+    };
+  }
+
+  let bestOverallMove: Move = legalMoves[0];
+  let bestOverallScore = -Infinity;
+  let completedDepth = 0;
+  let isTimeUp = false;
+
+  const depthIterations: DepthIterationInfo[] = [];
+  let latestCandidateEvals: { move: Move; score: number; whiteScore: number; nodes: number }[] = [];
+
+  const checkTime = (): boolean => {
+    if ((stats.totalNodes & 1023) === 0) {
+      if (Date.now() >= deadline) {
+        isTimeUp = true;
+      }
+    }
+    return isTimeUp;
+  };
+
+  for (let currentDepth = 1; currentDepth <= maxDepth; currentDepth++) {
+    if (Date.now() >= deadline) break;
+
+    // Snapshot stats before starting this depth to isolate per-depth node count
+    const nodesBeforeDepth = stats.totalNodes;
+
+    // FORWARD COMPATIBILITY NOTE (Phase 14 Aspiration Windows):
+    // If aspiration window re-search triggers on fail-high / fail-low, reset candidateMoves list here.
+    const iterationCandidates: { move: Move; score: number; whiteScore: number; nodes: number }[] = [];
+    let iterationBestMove: Move = bestOverallMove;
+    let iterationBestScore = -Infinity;
+    let iterationAlpha = -Infinity;
+    const iterationBeta = Infinity;
+
+    const currentMoves = orderMoves(legalMoves, bestOverallMove);
+    let iterationCompleted = true;
+
+    for (const move of currentMoves) {
+      if (checkTime()) {
+        iterationCompleted = false;
+        break;
+      }
+
+      const moveNodesBefore = stats.totalNodes;
+      game.move(move);
+      const score = -negamax(
+        game,
+        currentDepth - 1,
+        -iterationBeta,
+        -iterationAlpha,
+        checkTime,
+        stats
+      );
+      game.undo();
+      const moveNodes = stats.totalNodes - moveNodesBefore;
+
+      if (isTimeUp) {
+        iterationCompleted = false;
+        break;
+      }
+
+      const whiteScore = (game.turn() === 'w' ? score : -score) / 100;
+      iterationCandidates.push({ move, score, whiteScore, nodes: moveNodes });
+
+      if (score > iterationBestScore) {
+        iterationBestScore = score;
+        iterationBestMove = move;
+      }
+      if (score > iterationAlpha) {
+        iterationAlpha = score;
+      }
+    }
+
+    if (iterationCompleted) {
+      bestOverallMove = iterationBestMove;
+      bestOverallScore = iterationBestScore;
+      completedDepth = currentDepth;
+      latestCandidateEvals = iterationCandidates;
+
+      const depthNodes = stats.totalNodes - nodesBeforeDepth;
+      const iterWhiteScore = (game.turn() === 'w' ? iterationBestScore : -iterationBestScore) / 100;
+
+      depthIterations.push({
+        depth: currentDepth,
+        bestMoveSan: iterationBestMove.san,
+        whiteScore: iterWhiteScore,
+        timeMs: Date.now() - startTime,
+        nodes: depthNodes,
+      });
+
+      if (bestOverallScore === Infinity || bestOverallScore === -Infinity) {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+
+  // Update root position in TT
+  const rootKey = getPositionKey(fen);
+  transpositionTable.set(rootKey, {
+    depth: completedDepth,
+    score: bestOverallScore,
+    flag: 'exact',
+    bestMove: bestOverallMove,
+  });
+
+  // Sort candidate moves so the chosen best move is first
+  latestCandidateEvals.sort((a, b) => b.score - a.score);
+  const bestCandScore = latestCandidateEvals.length > 0 ? latestCandidateEvals[0].whiteScore : 0;
+
+  const candidateMoves: CandidateMoveEval[] = latestCandidateEvals.map((cand, idx) => {
+    const isBest = idx === 0;
+    const scoreDelta = isBest
+      ? 0
+      : Number((cand.whiteScore - bestCandScore).toFixed(2));
+    const rationale = deriveMoveRationale(cand.move, game);
+
+    return {
+      san: cand.move.san,
+      from: cand.move.from,
+      to: cand.move.to,
+      whiteScore: cand.whiteScore,
+      nodes: cand.nodes,
+      isBest,
+      rationale,
+      scoreDelta,
+    };
+  });
+
+  const finalWhiteScore = (game.turn() === 'w' ? bestOverallScore : -bestOverallScore) / 100;
+
+  return {
+    bestMove: bestOverallMove,
+    score: bestOverallScore,
+    whiteScore: finalWhiteScore,
+    depthReached: completedDepth,
+    stats,
+    timeMs: Date.now() - startTime,
+    candidateMoves,
+    depthIterations,
+  };
+}
+
+/**
+ * Backward-compatible entry point for iterative deepening.
+ */
+export function getBestMoveIterative(
+  fen: string,
+  timeLimitMs: number = 2000,
+  maxDepth: number = 20
+): IterativeSearchResult {
+  const result = getBestMoveIterativeDetailed(fen, timeLimitMs, maxDepth);
+  return {
+    bestMove: result.bestMove,
+    score: result.score,
+    depthReached: result.depthReached,
+    nodes: result.stats.totalNodes,
+    timeMs: result.timeMs,
+  };
+}
+
+/**
+ * Backward-compatible entry point for AI move selection.
+ */
+export function getBestMove(
+  fen: string,
+  depth = 3,
+  timeLimitMs?: number
+): Move | null {
+  if (timeLimitMs && timeLimitMs > 0) {
+    const res = getBestMoveIterativeDetailed(fen, timeLimitMs, 20);
+    return res.bestMove;
+  }
+  const res = getBestMoveDetailed(fen, depth);
+  return res.bestMove;
+}
+
 
 /**
  * Helper search function that returns engine telemetry (nodes evaluated, eval, depth).

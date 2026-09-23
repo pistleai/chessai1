@@ -5,7 +5,8 @@ import { Chess, type Square } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import EvalBar from "./EvalBar";
 import AIStats from "./AIStats";
-import { evaluateWhitePerspective } from "@/lib/ai/evaluation";
+import CalculationInspector, { CalculationDetails } from "./CalculationInspector";
+import { evaluateWhitePerspective, getEvaluationBreakdown } from "@/lib/ai/evaluation";
 
 export interface GameStatus {
   isOver: boolean;
@@ -44,6 +45,11 @@ export default function ChessBoard() {
     pv?: string[];
   }>({});
 
+  // Real-time calculation inspector telemetry (red box panel)
+  const [calculationDetails, setCalculationDetails] = useState<CalculationDetails>({
+    evalBreakdown: getEvaluationBreakdown(chessRef.current),
+  });
+
   const [gameStatus, setGameStatus] = useState<GameStatus>({
     isOver: false,
     message: "White to move",
@@ -59,6 +65,10 @@ export default function ChessBoard() {
     setSelectedSquare(null);
     setPossibleMoves([]);
     setEvaluation(evaluateWhitePerspective(game));
+    setCalculationDetails((prev) => ({
+      ...prev,
+      evalBreakdown: getEvaluationBreakdown(game),
+    }));
 
     if (game.isCheckmate()) {
       const winner = game.turn() === "w" ? "black" : "white";
@@ -129,6 +139,9 @@ export default function ChessBoard() {
               reasoning: e.data.reasoning,
               pv: e.data.pv,
             });
+            if (e.data.calculationDetails) {
+              setCalculationDetails(e.data.calculationDetails);
+            }
           }
         } catch (err) {
           console.error("Failed to apply worker move:", err);
@@ -136,6 +149,7 @@ export default function ChessBoard() {
       }
       setIsAIThinking(false);
     };
+
 
     worker.onerror = (err) => {
       console.error("Chess AI Worker error:", err);
@@ -249,6 +263,9 @@ export default function ChessBoard() {
     setPossibleMoves([]);
     setIsAIThinking(false);
     setAiTelemetry({});
+    setCalculationDetails({
+      evalBreakdown: getEvaluationBreakdown(chessRef.current),
+    });
     updateStateFromGame();
   };
 
@@ -314,7 +331,7 @@ export default function ChessBoard() {
   }
 
   return (
-    <div className="w-full max-w-5xl flex flex-col xl:flex-row items-center xl:items-start justify-center gap-6">
+    <div className="w-full max-w-[1440px] flex flex-col xl:flex-row items-center xl:items-start justify-center gap-6">
       {/* Chessboard + EvalBar Column */}
       <div className="flex flex-col items-center gap-3">
         {/* Turn & Status Header */}
@@ -567,6 +584,17 @@ export default function ChessBoard() {
           </div>
         </div>
       </div>
+
+      {/* Column 3: Algorithm Calculation Inspector (The Red Box area!) */}
+      {gameMode === "vs_ai" && (
+        <div className="w-full max-w-[600px] xl:max-w-none xl:w-[380px] 2xl:w-[420px] flex flex-col gap-3">
+          <CalculationInspector
+            calculationDetails={calculationDetails}
+            isThinking={isAIThinking}
+          />
+        </div>
+      )}
     </div>
   );
 }
+

@@ -1,5 +1,12 @@
 import { Chess, Move } from 'chess.js';
-import { getBestMove, getBestMoveIterative, explainMove, extractPV } from '../lib/ai/chessAI';
+import {
+  getBestMoveDetailed,
+  getBestMoveIterativeDetailed,
+  explainMove,
+  extractPV,
+  DetailedSearchResult,
+} from '../lib/ai/chessAI';
+import { getEvaluationBreakdown } from '../lib/ai/evaluation';
 
 /**
  * Dedicated Web Worker for running Chess AI search asynchronously without blocking the UI.
@@ -8,7 +15,7 @@ import { getBestMove, getBestMoveIterative, explainMove, extractPV } from '../li
  * - { fen: string, depth?: number } -> fixed depth search
  * - { fen: string, timeLimitMs?: number, isExpert?: boolean } -> time-limited iterative deepening
  *
- * Posts { move, bestMove, depthReached, nodes, timeMs, score, reasoning, pv } back to the main thread.
+ * Posts { move, bestMove, depthReached, nodes, timeMs, score, reasoning, pv, calculationDetails } back.
  */
 self.onmessage = (e: MessageEvent) => {
   const data = e.data || {};
@@ -23,28 +30,17 @@ self.onmessage = (e: MessageEvent) => {
 
   try {
     const game = new Chess(fen);
-    let move: Move | null = null;
-    let depthReached = typeof depth === 'number' ? depth : 3;
-    let nodes = 0;
-    let timeMs = 0;
-    let score = 0;
+    let detailedResult: DetailedSearchResult;
 
     if (isExpert || timeLimitMs) {
       const budget = typeof timeLimitMs === 'number' ? timeLimitMs : 2000;
-      const result = getBestMoveIterative(fen, budget, 20);
-      move = result.bestMove;
-      depthReached = result.depthReached;
-      nodes = result.nodes;
-      timeMs = result.timeMs;
-      score = result.score;
+      detailedResult = getBestMoveIterativeDetailed(fen, budget, 20);
     } else {
-      const t0 = Date.now();
       const numDepth = typeof depth === 'number' ? depth : 3;
-      move = getBestMove(fen, numDepth);
-      timeMs = Date.now() - t0;
-      depthReached = numDepth;
+      detailedResult = getBestMoveDetailed(fen, numDepth);
     }
 
+    const move: Move | null = detailedResult.bestMove;
     let reasoning = 'Developed position.';
     let pv: string[] = [];
 
@@ -53,15 +49,36 @@ self.onmessage = (e: MessageEvent) => {
       pv = extractPV(game, 3);
     }
 
+    // Compute nominal-only pruning efficiency: excludes qNodes to prevent distortion
+    const legalMovesCount = game.moves().length;
+    const nominalNodes = Math.max(1, detailedResult.stats.totalNodes - detailedResult.stats.qNodes);
+    const estimatedFullTree = Math.pow(Math.max(1, legalMovesCount), detailedResult.depthReached);
+    const pruningEfficiency = estimatedFullTree > 0
+      ? Math.max(0, Math.min(99.9, Number(((1 - nominalNodes / estimatedFullTree) * 100).toFixed(1))))
+      : 0;
+
+    const evalBreakdown = getEvaluationBreakdown(game);
+
+    const calculationDetails = {
+      candidateMoves: detailedResult.candidateMoves,
+      depthIterations: detailedResult.depthIterations,
+      stats: detailedResult.stats,
+      pruningEfficiency,
+      evalBreakdown,
+      estimatedFullTree,
+      nominalNodes,
+    };
+
     self.postMessage({
       move,
       bestMove: move,
-      depthReached,
-      score,
-      nodes,
-      timeMs,
+      depthReached: detailedResult.depthReached,
+      score: detailedResult.whiteScore,
+      nodes: detailedResult.stats.totalNodes,
+      timeMs: detailedResult.timeMs,
       reasoning,
       pv,
+      calculationDetails,
     });
   } catch (err) {
     console.error('Chess AI worker execution error:', err);
@@ -72,5 +89,6 @@ self.onmessage = (e: MessageEvent) => {
     });
   }
 };
+
 
 export {};

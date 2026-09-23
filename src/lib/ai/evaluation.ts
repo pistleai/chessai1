@@ -230,3 +230,97 @@ export function evaluateWhitePerspective(game: Chess): number {
   const sideToMoveScore = evaluate(game);
   return game.turn() === 'w' ? sideToMoveScore : -sideToMoveScore;
 }
+
+/**
+ * Calculates continuous game phase between 0.0 (pure endgame) and 1.0 (opening/middlegame).
+ * Non-pawn piece weights: Knight=1, Bishop=1, Rook=2, Queen=4. Total for both sides = 24.
+ */
+export function getGamePhase(game: Chess): number {
+  let totalWeight = 0;
+  const board = game.board();
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = board[r][c];
+      if (!piece) continue;
+      if (piece.type === 'n' || piece.type === 'b') totalWeight += 1;
+      else if (piece.type === 'r') totalWeight += 2;
+      else if (piece.type === 'q') totalWeight += 4;
+    }
+  }
+
+  return Math.min(1, Math.max(0, totalWeight / 24));
+}
+
+export interface EvaluationBreakdown {
+  whiteMaterial: number;
+  blackMaterial: number;
+  materialDiff: number;
+  whitePST: number;
+  blackPST: number;
+  pstDiff: number;
+  totalScore: number;            // side-to-move perspective (engine internal)
+  whitePerspectiveScore: number; // ALWAYS use this for UI display
+  gamePhase: number;             // 0.0 = pure endgame, 1.0 = opening/middlegame
+}
+
+/**
+ * Generates transparent mathematical breakdown of the static evaluation function.
+ */
+export function getEvaluationBreakdown(game: Chess): EvaluationBreakdown {
+  let whiteMaterial = 0;
+  let blackMaterial = 0;
+  let whitePST = 0;
+  let blackPST = 0;
+
+  const board = game.board();
+  const endgame = isEndgame(game);
+  const phase = getGamePhase(game);
+
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = board[r][c];
+      if (!piece) continue;
+
+      const materialVal = PIECE_VALUES[piece.type] ?? 0;
+      let pstVal = 0;
+
+      if (piece.type === 'k' && endgame) {
+        pstVal = piece.color === 'w'
+          ? KING_ENDGAME_TABLE[r][c]
+          : KING_ENDGAME_TABLE[7 - r][c];
+      } else {
+        const table = PST[piece.type];
+        pstVal = piece.color === 'w'
+          ? table[r][c]
+          : table[7 - r][c];
+      }
+
+      if (piece.color === 'w') {
+        whiteMaterial += materialVal;
+        whitePST += pstVal;
+      } else {
+        blackMaterial += materialVal;
+        blackPST += pstVal;
+      }
+    }
+  }
+
+  const materialDiff = whiteMaterial - blackMaterial;
+  const pstDiff = whitePST - blackPST;
+  const totalScoreSide = evaluate(game);
+  const whitePerspectiveScore = evaluateWhitePerspective(game);
+
+  return {
+    whiteMaterial,
+    blackMaterial,
+    materialDiff,
+    whitePST,
+    blackPST,
+    pstDiff,
+    totalScore: totalScoreSide,
+    whitePerspectiveScore,
+    gamePhase: Number(phase.toFixed(2)),
+  };
+}
+
