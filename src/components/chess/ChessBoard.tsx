@@ -35,8 +35,10 @@ export default function ChessBoard() {
 
   // AI & Game Mode State
   const [gameMode, setGameMode] = useState<"vs_ai" | "pvp">("vs_ai");
+  const [playerColor, setPlayerColor] = useState<"w" | "b">("w");
   const [difficulty, setDifficulty] = useState<DifficultyLevel>(3);
   const [isAIThinking, setIsAIThinking] = useState(false);
+  const currentRequestIdRef = useRef<number>(0);
   const [aiTelemetry, setAiTelemetry] = useState<{
     depth?: number;
     nodesEvaluated?: number;
@@ -55,6 +57,26 @@ export default function ChessBoard() {
     message: "White to move",
     type: "in_progress",
   });
+
+  const triggerAIMove = useCallback((game: Chess) => {
+    if (game.isGameOver()) return;
+    setIsAIThinking(true);
+    const reqId = ++currentRequestIdRef.current;
+    if (difficulty === "expert") {
+      workerRef.current?.postMessage({
+        fen: game.fen(),
+        isExpert: true,
+        timeLimitMs: 2000,
+        requestId: reqId,
+      });
+    } else {
+      workerRef.current?.postMessage({
+        fen: game.fen(),
+        depth: difficulty,
+        requestId: reqId,
+      });
+    }
+  }, [difficulty]);
 
   const updateStateFromGame = useCallback(() => {
     const game = chessRef.current;
@@ -107,13 +129,18 @@ export default function ChessBoard() {
         message: "Draw (50-move rule)!",
       });
     } else {
+      const currentTurnColor = game.turn() === "w" ? "White" : "Black";
+      const isPlayerTurn = gameMode === "vs_ai" ? game.turn() === playerColor : true;
       setGameStatus({
         isOver: false,
         type: "in_progress",
-        message: `${game.turn() === "w" ? "White" : "Black"} to move`,
+        message:
+          gameMode === "vs_ai"
+            ? `${currentTurnColor} ${isPlayerTurn ? "(You)" : "(AI)"} to move`
+            : `${currentTurnColor} to move`,
       });
     }
-  }, []);
+  }, [gameMode, playerColor]);
 
   // Web Worker setup & lifecycle
   useEffect(() => {
@@ -125,6 +152,11 @@ export default function ChessBoard() {
     workerRef.current = worker;
 
     worker.onmessage = (e: MessageEvent) => {
+      // Discard stale calculation if search request was invalidated or superseded
+      if (e.data?.requestId !== undefined && e.data.requestId !== currentRequestIdRef.current) {
+        return;
+      }
+
       const move = e.data?.move || e.data?.bestMove;
       if (move && !chessRef.current.isGameOver()) {
         try {
@@ -150,7 +182,6 @@ export default function ChessBoard() {
       setIsAIThinking(false);
     };
 
-
     worker.onerror = (err) => {
       console.error("Chess AI Worker error:", err);
       setIsAIThinking(false);
@@ -169,7 +200,7 @@ export default function ChessBoard() {
       return false;
     }
 
-    if (gameMode === "vs_ai" && game.turn() !== "w") {
+    if (gameMode === "vs_ai" && game.turn() !== playerColor) {
       return false;
     }
 
@@ -187,21 +218,9 @@ export default function ChessBoard() {
       setLastMove({ from, to });
       updateStateFromGame();
 
-      // If playing vs AI and now it's Black's turn, trigger worker
-      if (gameMode === "vs_ai" && game.turn() === "b" && !game.isGameOver()) {
-        setIsAIThinking(true);
-        if (difficulty === "expert") {
-          workerRef.current?.postMessage({
-            fen: game.fen(),
-            isExpert: true,
-            timeLimitMs: 2000,
-          });
-        } else {
-          workerRef.current?.postMessage({
-            fen: game.fen(),
-            depth: difficulty,
-          });
-        }
+      // If playing vs AI and now it's AI's turn, trigger worker
+      if (gameMode === "vs_ai" && game.turn() !== playerColor && !game.isGameOver()) {
+        triggerAIMove(game);
       }
 
       return true;
@@ -212,14 +231,14 @@ export default function ChessBoard() {
 
   const onPieceDrop = (sourceSquare: Square, targetSquare: Square): boolean => {
     if (isAIThinking) return false;
-    if (gameMode === "vs_ai" && chessRef.current.turn() !== "w") return false;
+    if (gameMode === "vs_ai" && chessRef.current.turn() !== playerColor) return false;
     return makeAMove(sourceSquare, targetSquare);
   };
 
   const onSquareClick = (square: Square) => {
     const game = chessRef.current;
     if (game.isGameOver() || isAIThinking) return;
-    if (gameMode === "vs_ai" && game.turn() !== "w") return;
+    if (gameMode === "vs_ai" && game.turn() !== playerColor) return;
 
     if (!selectedSquare) {
       const piece = game.get(square);
@@ -256,18 +275,93 @@ export default function ChessBoard() {
     }
   };
 
-  const resetGame = () => {
-    chessRef.current.reset();
-    setLastMove(null);
-    setSelectedSquare(null);
-    setPossibleMoves([]);
+  const resetGame = useCallback(
+    (colorToSet?: "w" | "b", modeToSet?: "vs_ai" | "pvp") => {
+      currentRequestIdRef.current++;
+      chessRef.current.reset();
+      setLastMove(null);
+      setSelectedSquare(null);
+      setPossibleMoves([]);
+      setIsAIThinking(false);
+      setAiTelemetry({});
+      setCalculationDetails({
+        evalBreakdown: getEvaluationBreakdown(chessRef.current),
+      });
+      updateStateFromGame();
+
+      const activeMode = modeToSet !== undefined ? modeToSet : gameMode;
+      const activeColor = colorToSet !== undefined ? colorToSet : playerColor;
+      if (activeMode === "vs_ai" && activeColor === "b") {
+        triggerAIMove(chessRef.current);
+      }
+    },
+    [gameMode, playerColor, triggerAIMove, updateStateFromGame]
+  );
+
+  const undoPlayerMove = useCallback(() => {
+    const game = chessRef.current;
+    if (game.history().length === 0) return;
+
+    // Invalidate in-flight search requests immediately (interrupted search discarded)
+    currentRequestIdRef.current++;
     setIsAIThinking(false);
+
+    // Dynamic 2-ply vs 1-ply rule based on actual playerColor:
+    // If vs_ai and human is up next, undo 2 plies (AI reply + human move) if history >= 2.
+    // If AI is currently up next (or history < 2), undo 1 ply.
+    // If pvp, always undo 1 ply.
+    const isHumanUpNext = gameMode === "vs_ai" ? game.turn() === playerColor : true;
+    const pliesToUndo = gameMode === "vs_ai" && isHumanUpNext && game.history().length >= 2 ? 2 : 1;
+
+    for (let i = 0; i < pliesToUndo; i++) {
+      game.undo();
+    }
+
+    // Restore lastMove highlight from remaining history
+    const remainingHistory = game.history({ verbose: true });
+    if (remainingHistory.length > 0) {
+      const prev = remainingHistory[remainingHistory.length - 1];
+      setLastMove({ from: prev.from as Square, to: prev.to as Square });
+    } else {
+      setLastMove(null);
+    }
+
+    // Clear stale telemetry & calculation inspector data synchronously
     setAiTelemetry({});
     setCalculationDetails({
-      evalBreakdown: getEvaluationBreakdown(chessRef.current),
+      evalBreakdown: getEvaluationBreakdown(game),
+      candidateMoves: [],
+      depthIterations: [],
+      pruningEfficiency: 0,
+      stats: undefined,
     });
+
     updateStateFromGame();
-  };
+  }, [gameMode, playerColor, updateStateFromGame]);
+
+  // Global Keyboard Shortcut: Ctrl+Z / Cmd+Z to undo
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+        const activeEl = document.activeElement;
+        if (
+          activeEl &&
+          (activeEl.tagName === "INPUT" ||
+            activeEl.tagName === "TEXTAREA" ||
+            (activeEl as HTMLElement).isContentEditable)
+        ) {
+          return;
+        }
+        e.preventDefault();
+        undoPlayerMove();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [undoPlayerMove]);
 
   const customSquareStyles: Record<string, React.CSSProperties> = {};
 
@@ -349,11 +443,11 @@ export default function ChessBoard() {
                 }`}
               />
               <span className="text-xs font-semibold text-slate-200">
-                {turn === "w"
-                  ? "White's Turn (You)"
-                  : gameMode === "vs_ai"
-                  ? "Black's Turn (AI)"
-                  : "Black's Turn"}
+                {gameMode === "pvp"
+                  ? `${turn === "w" ? "White" : "Black"}'s Turn`
+                  : turn === playerColor
+                  ? `${turn === "w" ? "White" : "Black"}'s Turn (You)`
+                  : `${turn === "w" ? "White" : "Black"}'s Turn (AI)`}
               </span>
             </div>
 
@@ -382,13 +476,25 @@ export default function ChessBoard() {
             )}
           </div>
 
-          <button
-            id="reset-game-btn"
-            onClick={resetGame}
-            className="px-3.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg border border-slate-700 transition duration-150 active:scale-95 shadow-sm"
-          >
-            Reset Game
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              id="undo-move-btn"
+              onClick={undoPlayerMove}
+              disabled={history.length === 0}
+              title="Undo last move (Ctrl+Z)"
+              className="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-slate-800 text-slate-300 hover:text-white rounded-lg border border-slate-700 transition duration-150 active:scale-95 shadow-sm flex items-center gap-1.5"
+            >
+              <span>↩</span>
+              <span>Undo</span>
+            </button>
+            <button
+              id="reset-game-btn"
+              onClick={() => resetGame()}
+              className="px-3.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg border border-slate-700 transition duration-150 active:scale-95 shadow-sm"
+            >
+              Reset Game
+            </button>
+          </div>
         </div>
 
         {gameStatus.isOver && (
@@ -428,12 +534,12 @@ export default function ChessBoard() {
               isDraggablePiece={({ piece }) => {
                 if (isAIThinking || gameStatus.isOver) return false;
                 if (gameMode === "vs_ai") {
-                  return piece.startsWith("w");
+                  return piece.startsWith(playerColor);
                 }
                 return piece.startsWith(turn);
               }}
               autoPromoteToQueen={true}
-              boardOrientation="white"
+              boardOrientation={playerColor === "w" ? "white" : "black"}
               animationDuration={200}
               customBoardStyle={{
                 borderRadius: "12px",
@@ -467,7 +573,7 @@ export default function ChessBoard() {
             <button
               onClick={() => {
                 setGameMode("vs_ai");
-                resetGame();
+                resetGame(playerColor, "vs_ai");
               }}
               className={`py-1.5 px-3 text-xs font-semibold rounded-lg border transition ${
                 gameMode === "vs_ai"
@@ -480,7 +586,7 @@ export default function ChessBoard() {
             <button
               onClick={() => {
                 setGameMode("pvp");
-                resetGame();
+                resetGame(playerColor, "pvp");
               }}
               className={`py-1.5 px-3 text-xs font-semibold rounded-lg border transition ${
                 gameMode === "pvp"
@@ -491,6 +597,54 @@ export default function ChessBoard() {
               Pass & Play
             </button>
           </div>
+
+          {/* Player Color Choice when vs AI */}
+          {gameMode === "vs_ai" && (
+            <div className="pt-2 border-t border-slate-800/80 flex flex-col gap-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-400 font-medium">Play As</span>
+                <span className="text-amber-300 font-medium text-[11px]">
+                  {playerColor === "w" ? "White (First Move)" : "Black (AI Moves First)"}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  id="play-as-white-btn"
+                  onClick={() => {
+                    if (playerColor !== "w") {
+                      setPlayerColor("w");
+                      resetGame("w", "vs_ai");
+                    }
+                  }}
+                  className={`py-1.5 px-2.5 rounded-lg text-xs font-medium border flex items-center justify-center gap-1.5 transition ${
+                    playerColor === "w"
+                      ? "bg-amber-500/20 border-amber-500/60 text-amber-200 shadow-sm"
+                      : "bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <span className="w-2.5 h-2.5 rounded-full bg-amber-100 border border-slate-400 shadow-sm" />
+                  <span>White</span>
+                </button>
+                <button
+                  id="play-as-black-btn"
+                  onClick={() => {
+                    if (playerColor !== "b") {
+                      setPlayerColor("b");
+                      resetGame("b", "vs_ai");
+                    }
+                  }}
+                  className={`py-1.5 px-2.5 rounded-lg text-xs font-medium border flex items-center justify-center gap-1.5 transition ${
+                    playerColor === "b"
+                      ? "bg-amber-500/20 border-amber-500/60 text-amber-200 shadow-sm"
+                      : "bg-slate-800/60 border-slate-700 text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <span className="w-2.5 h-2.5 rounded-full bg-slate-950 border border-slate-600 shadow-sm" />
+                  <span>Black</span>
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* AI Difficulty Selector */}
           {gameMode === "vs_ai" && (
@@ -563,7 +717,9 @@ export default function ChessBoard() {
           >
             {movePairs.length === 0 ? (
               <p className="text-xs text-slate-600 italic py-6 text-center">
-                No moves played yet. Drag or click White pieces to begin!
+                {gameMode === "vs_ai" && playerColor === "b"
+                  ? "AI is preparing its opening move..."
+                  : "No moves played yet. Drag or click pieces to begin!"}
               </p>
             ) : (
               movePairs.map((pair) => (

@@ -79,6 +79,7 @@ self.onmessage = (e: MessageEvent) => {
       reasoning,
       pv,
       calculationDetails,
+      requestId: data.requestId,
     });
   } catch (err) {
     console.error('Chess AI worker execution error:', err);
@@ -86,6 +87,7 @@ self.onmessage = (e: MessageEvent) => {
       move: null,
       bestMove: null,
       error: String(err),
+      requestId: data.requestId,
     });
   }
 };
